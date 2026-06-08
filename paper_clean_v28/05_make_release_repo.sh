@@ -187,8 +187,13 @@ chmod +x "$RELEASE_DIR/CHECK_FILE_SIZES.sh"
 
 echo "[5/6] 初始化 Git 仓库"
 cd "$RELEASE_DIR"
-git init
-git branch -M main
+if git init -b main >/dev/null 2>&1; then
+  echo "已初始化 main 分支。"
+else
+  git init
+  git symbolic-ref HEAD refs/heads/main
+  echo "已设置 HEAD 到 main 分支。"
+fi
 
 echo "[6/6] 显示大文件和仓库状态"
 echo "大于 50M 的文件："
