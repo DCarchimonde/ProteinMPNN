@@ -19,6 +19,8 @@
 """
 
 import os
+os.environ["OMP_NUM_THREADS"] = "1"
+
 import argparse
 from typing import List, Dict, Any
 
@@ -31,14 +33,11 @@ from clean_v28_common import (
     NATURAL_AA_ALPHABET,
     X_INDEX,
     N_NATURAL,
-    METHYL_ABS_TO_NAT,
-    NAT_TO_METHYL_ABS,
     load_v28_model,
     read_jsonl,
     write_csv,
     write_json,
     featurize_records,
-    naturalize_indices_np,
     naturalize_tensor_for_input,
     binary_metrics,
     roc_auc_score_simple,
@@ -64,6 +63,18 @@ def best_row(rows: List[Dict[str, Any]], key: str = "f1") -> Dict[str, Any]:
     if not rows:
         return {}
     return max(rows, key=lambda r: r.get(key, 0.0))
+
+
+def safe_expert_gather(logits_experts: torch.Tensor, index_tensor: torch.Tensor) -> torch.Tensor:
+    """
+    logits_experts 最后一维只有 20 个天然氨基酸专家。
+    padding 和 X 的 index 可能是 39，不能直接 gather。
+    这里先把所有非 0-19 的位置临时改成 0。
+    后面真正统计时仍然只取 valid_selected 位点，所以这些临时值不会进入指标。
+    """
+    safe_index = index_tensor.clone()
+    safe_index[(safe_index < 0) | (safe_index >= N_NATURAL)] = 0
+    return torch.gather(logits_experts, -1, safe_index.unsqueeze(-1)).squeeze(-1)
 
 
 def run_input_mode(model, loader, device, args, input_mode: str, thresholds: List[float]):
@@ -115,8 +126,8 @@ def run_input_mode(model, loader, device, args, input_mode: str, thresholds: Lis
             pred_base = torch.argmax(logits_base, dim=-1)
             true_base_tensor = naturalize_tensor_for_input(S_label)
 
-            prob_known = torch.sigmoid(torch.gather(logits_experts, -1, true_base_tensor.unsqueeze(-1)).squeeze(-1))
-            prob_e2e = torch.sigmoid(torch.gather(logits_experts, -1, pred_base.unsqueeze(-1)).squeeze(-1))
+            prob_known = torch.sigmoid(safe_expert_gather(logits_experts, true_base_tensor))
+            prob_e2e = torch.sigmoid(safe_expert_gather(logits_experts, pred_base))
 
             for bi, meta in enumerate(metas):
                 meta_rows.append({
@@ -142,9 +153,9 @@ def run_input_mode(model, loader, device, args, input_mode: str, thresholds: Lis
                         "target_token_index": target_ext,
                         "target_token": EXTENDED_AA_ALPHABET[target_ext] if target_ext < len(EXTENDED_AA_ALPHABET) else "?",
                         "true_base_index": true_base,
-                        "true_base_token": NATURAL_AA_ALPHABET[true_base] if true_base < len(NATURAL_AA_ALPHABET) else "?",
+                        "true_base_token": NATURAL_AA_ALPHABET[true_base] if 0 <= true_base < len(NATURAL_AA_ALPHABET) else "?",
                         "pred_base_index": pred_b,
-                        "pred_base_token": NATURAL_AA_ALPHABET[pred_b] if pred_b < len(NATURAL_AA_ALPHABET) else "?",
+                        "pred_base_token": NATURAL_AA_ALPHABET[pred_b] if 0 <= pred_b < len(NATURAL_AA_ALPHABET) else "?",
                         "base_correct": int(pred_b == true_base),
                         "is_methyl_true": is_methyl,
                         "prob_methyl_known_sequence": pk,
