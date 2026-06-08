@@ -7,23 +7,18 @@
 评价已经生成的 FASTA 序列。
 不加载模型，只比较生成短肽序列和天然短肽序列。
 
-输出：
-1. all_designs.csv：所有设计序列。
-2. unique_designs.csv：去重后的设计序列。
-3. summary_by_target.csv：每个目标汇总。
-4. summary_by_temperature.csv：每个温度汇总。
-5. best_designs.csv：每个目标每个温度的最佳序列。
-
-注意：
-- 这个脚本只算序列层面的指标。
-- 甲基化小写会先映射回天然氨基酸后再算基础氨基酸恢复率。
-- 甲基化数量和比例会单独统计。
+重要：
+- 对于有两条相同短肽链的复合物，生成 FASTA 往往只含一条短肽序列。
+- 因此推荐使用 --eval_chains auto_single。
+- auto_single 会根据设计序列长度自动选择长度一致的短链；如果多条短链序列完全相同，选择第一条并记录候选链。
 """
 
 import os
+os.environ["OMP_NUM_THREADS"] = "1"
+
 import re
 import argparse
-from typing import Dict, Any, List, Tuple, Optional
+from typing import Dict, Any, List, Optional
 
 import numpy as np
 
@@ -33,6 +28,7 @@ from clean_v28_common import (
     write_json,
     parse_fasta,
     choose_eval_chains,
+    chain_ids_from_record,
     get_record_name,
     naturalize_sequence,
     sequence_recovery,
@@ -44,24 +40,93 @@ def collect_native_targets(native_jsonl: str, eval_chains: str, max_peptide_len:
     records = read_jsonl(native_jsonl)
     targets = {}
     manifest = []
+
     for i, r in enumerate(records):
         name = get_record_name(r, i)
-        selected = choose_eval_chains(r, eval_chains, max_peptide_len, chain_ids)
-        if not selected:
-            continue
-        seq = "".join(r.get(f"seq_chain_{c}", "") for c in selected)
-        if not seq:
-            continue
-        targets[name.lower()] = {
+        all_chain_ids = chain_ids_from_record(r)
+        short_candidates = []
+        for c in all_chain_ids:
+            seq_c = r.get(f"seq_chain_{c}", "")
+            if 0 < len(seq_c) <= max_peptide_len:
+                short_candidates.append({
+                    "chain_id": c,
+                    "seq": seq_c,
+                    "natural_seq": naturalize_sequence(seq_c),
+                    "length": len(seq_c),
+                    "methyl_count": methyl_count(seq_c),
+                })
+
+        if eval_chains == "auto_single":
+            selected = []
+            seq = ""
+        else:
+            selected = choose_eval_chains(r, eval_chains, max_peptide_len, chain_ids)
+            seq = "".join(r.get(f"seq_chain_{c}", "") for c in selected)
+            if not selected or not seq:
+                continue
+
+        target = {
             "target_name": name,
             "selected_chains": ",".join(selected),
             "native_seq": seq,
             "native_natural_seq": naturalize_sequence(seq),
             "native_length": len(seq),
             "native_methyl_count": methyl_count(seq),
+            "short_candidates": short_candidates,
+            "all_chain_ids": all_chain_ids,
         }
-        manifest.append(targets[name.lower()])
+        targets[name.lower()] = target
+        manifest.append({
+            "target_name": name,
+            "selected_chains_initial": ",".join(selected),
+            "native_length_initial": len(seq),
+            "short_candidate_chains": ";".join(f"{x['chain_id']}:{x['length']}:{x['seq']}" for x in short_candidates),
+        })
     return targets, manifest
+
+
+def resolve_target_for_design(target: Dict[str, Any], design_seq: str, eval_chains: str) -> Dict[str, Any]:
+    """根据设计序列长度确定用于比较的天然链。"""
+    if eval_chains != "auto_single":
+        out = dict(target)
+        out["chain_resolution_status"] = "fixed_by_user_mode"
+        out["candidate_chains_same_length"] = ""
+        return out
+
+    design_len = len(design_seq)
+    candidates = [x for x in target["short_candidates"] if x["length"] == design_len]
+    if not candidates:
+        out = dict(target)
+        out.update({
+            "selected_chains": "",
+            "native_seq": "",
+            "native_natural_seq": "",
+            "native_length": 0,
+            "native_methyl_count": 0,
+            "chain_resolution_status": "no_short_chain_length_match",
+            "candidate_chains_same_length": "",
+        })
+        return out
+
+    unique_nat_seqs = sorted(set(x["natural_seq"] for x in candidates))
+    chosen = candidates[0]
+    status = "unique_length_match"
+    if len(candidates) > 1 and len(unique_nat_seqs) == 1:
+        status = "multiple_chains_same_sequence"
+    elif len(candidates) > 1 and len(unique_nat_seqs) > 1:
+        status = "ambiguous_multiple_different_sequences"
+
+    out = dict(target)
+    out.update({
+        "selected_chains": chosen["chain_id"],
+        "native_seq": chosen["seq"],
+        "native_natural_seq": chosen["natural_seq"],
+        "native_length": chosen["length"],
+        "native_methyl_count": chosen["methyl_count"],
+        "chain_resolution_status": status,
+        "candidate_chains_same_length": ";".join(f"{x['chain_id']}:{x['seq']}" for x in candidates),
+    })
+    return out
 
 
 def infer_temperature_from_text(text: str) -> str:
@@ -81,8 +146,6 @@ def infer_temperature_from_text(text: str) -> str:
 def find_target_for_fasta(fasta_path: str, header: str, targets: Dict[str, Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     base = os.path.basename(fasta_path).lower()
     h = header.lower()
-
-    # 优先最长名字匹配，避免短名字误匹配。
     for key in sorted(targets.keys(), key=len, reverse=True):
         if key in base or key in h:
             return targets[key]
@@ -126,7 +189,7 @@ def main():
     parser.add_argument("--native_jsonl", required=True)
     parser.add_argument("--fasta_dir", required=True)
     parser.add_argument("--out_dir", required=True)
-    parser.add_argument("--eval_chains", choices=["masked", "short", "all", "chain"], default="short")
+    parser.add_argument("--eval_chains", choices=["masked", "short", "all", "chain", "auto_single"], default="auto_single")
     parser.add_argument("--max_peptide_len", type=int, default=30)
     parser.add_argument("--chain_ids", type=str, default=None)
     args = parser.parse_args()
@@ -145,14 +208,16 @@ def main():
         fasta_records = parse_fasta(fasta_path)
         temp_from_path = infer_temperature_from_text(fasta_path.replace("\\", "/"))
         for rec_idx, (header, seq) in enumerate(fasta_records):
-            target = find_target_for_fasta(fasta_path, header, targets)
-            if target is None:
+            raw_target = find_target_for_fasta(fasta_path, header, targets)
+            if raw_target is None:
                 warnings.append({
                     "fasta_path": fasta_path,
                     "header": header,
                     "warning": "无法从文件名或 header 匹配 native target",
                 })
                 continue
+
+            target = resolve_target_for_design(raw_target, seq, args.eval_chains)
             temp = infer_temperature_from_text(header)
             if temp == "unknown":
                 temp = temp_from_path
@@ -161,9 +226,21 @@ def main():
             length_match = len(seq) == target["native_length"]
             m_count = methyl_count(seq)
 
+            if target.get("chain_resolution_status") in ["no_short_chain_length_match", "ambiguous_multiple_different_sequences"]:
+                warnings.append({
+                    "target_name": target["target_name"],
+                    "fasta_path": fasta_path,
+                    "header": header,
+                    "design_length": len(seq),
+                    "warning": target.get("chain_resolution_status", "unknown_chain_resolution_problem"),
+                    "candidate_chains_same_length": target.get("candidate_chains_same_length", ""),
+                })
+
             all_rows.append({
                 "target_name": target["target_name"],
                 "selected_chains": target["selected_chains"],
+                "chain_resolution_status": target.get("chain_resolution_status", ""),
+                "candidate_chains_same_length": target.get("candidate_chains_same_length", ""),
                 "temperature": temp,
                 "fasta_file": fasta_path,
                 "record_index": rec_idx,
@@ -180,11 +257,10 @@ def main():
                 "design_methyl_rate": m_count / len(seq) if len(seq) else 0.0,
             })
 
-    # 去重：同一 target、temperature、design_seq 只保留一条。
     seen = set()
     unique_rows = []
     for r in all_rows:
-        key = (r["target_name"], r["temperature"], r["design_seq"])
+        key = (r["target_name"], r["selected_chains"], r["temperature"], r["design_seq"])
         if key not in seen:
             seen.add(key)
             unique_rows.append(r)
@@ -216,6 +292,7 @@ def main():
         "n_native_targets": len(targets),
         "n_raw_designs": len(all_rows),
         "n_unique_designs": len(unique_rows),
+        "n_best_rows": len(best_rows),
         "n_warnings": len(warnings),
     }
     write_json(os.path.join(args.out_dir, "report.json"), report)
@@ -223,6 +300,7 @@ def main():
     print("完成 FASTA 干净评价。")
     print(report)
     print("输出目录:", args.out_dir)
+    print("推荐论文序列评价优先使用 --eval_chains auto_single 的输出。")
 
 
 if __name__ == "__main__":
